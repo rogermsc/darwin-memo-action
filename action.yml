@@ -47,14 +47,16 @@ inputs:
     description: >
       A darwin-memo-ticket id (12 hex chars) to settle, typically
       parsed from the merge commit message or PR body by the caller.
-      When empty, settle-ci reads `darwin-memo-ticket: <id>` lines from
-      the PR_BODY environment variable, so you can instead set
-      `env: PR_BODY: ${{ github.event.pull_request.body }}` on the
-      step that uses this action.
+      When empty, settle-ci reads `darwin-memo-ticket: <id>` lines
+      from the PR_BODY environment variable, so you can instead set
+      PR_BODY to the pull request body (github.event.pull_request.body
+      in workflow expressions) on the step that uses this action.
     default: ""
   detail:
-    description: Settlement detail recorded with each settled ticket.
-    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    description: >
+      Settlement detail recorded with each settled ticket. Defaults to
+      the URL of the workflow run that did the settling.
+    default: ""
   commit-store:
     description: >
       When "true", commit and push the updated store (and the
@@ -120,6 +122,9 @@ runs:
         TICKET: ${{ inputs.ticket }}
         DETAIL: ${{ inputs.detail }}
       run: |
+        if [ -z "$DETAIL" ]; then
+          DETAIL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+        fi
         args=( "$STORE_PATH" --scale "$SCALE" --expire-after "$EXPIRE_AFTER" --detail "$DETAIL" )
         if [ -n "$JUNIT_BASE" ]; then
           args+=( --base-xml "$JUNIT_BASE" )
