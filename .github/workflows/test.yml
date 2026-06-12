@@ -1,0 +1,104 @@
+name: Test
+
+# Exercises the action against synthetic junit fixtures: one
+# regression, one improvement, one abstention. The CLI installs from a
+# commit of the main repo pinned by sha, so this suite never depends
+# on a PyPI release.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  PACKAGE_SPEC: git+https://github.com/rogermsc/darwin-memo@d7fb5b753d9caf73a85f8084c9527f612dadd7a2
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Settle a run where one test went from pass to fail
+        id: settle
+        uses: ./
+        with:
+          junit-base: tests/fixtures/all_pass.xml
+          junit-head: tests/fixtures/one_fail.xml
+          commit-store: "false"
+          package-spec: ${{ env.PACKAGE_SPEC }}
+      - name: Assert settled with delta -1.0
+        env:
+          RESULT: ${{ steps.settle.outputs.result }}
+          DELTA: ${{ steps.settle.outputs.delta }}
+          SUMMARY: ${{ steps.settle.outputs.summary }}
+        run: |
+          echo "summary: $SUMMARY"
+          test "$RESULT" = "settled"
+          test "$DELTA" = "-1.0"
+          test -f .darwin-memo/lessons.json
+          printf '%s' "$SUMMARY" | python3 -c '
+          import json, sys
+          out = json.load(sys.stdin)
+          assert out["mode"] == "junit", out
+          assert out["regressions"] == ["tests.test_sample::test_b"], out
+          assert out["improvements"] == [], out
+          '
+
+  improvement:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Settle a run where one test went from fail to pass
+        id: settle
+        uses: ./
+        with:
+          junit-base: tests/fixtures/one_fail.xml
+          junit-head: tests/fixtures/all_pass.xml
+          commit-store: "false"
+          package-spec: ${{ env.PACKAGE_SPEC }}
+      - name: Assert settled with delta 1.0
+        env:
+          RESULT: ${{ steps.settle.outputs.result }}
+          DELTA: ${{ steps.settle.outputs.delta }}
+          SUMMARY: ${{ steps.settle.outputs.summary }}
+        run: |
+          echo "summary: $SUMMARY"
+          test "$RESULT" = "settled"
+          test "$DELTA" = "1.0"
+          test -f .darwin-memo/lessons.json
+          printf '%s' "$SUMMARY" | python3 -c '
+          import json, sys
+          out = json.load(sys.stdin)
+          assert out["mode"] == "junit", out
+          assert out["improvements"] == ["tests.test_sample::test_b"], out
+          assert out["regressions"] == [], out
+          '
+
+  abstention:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Settle a run whose head report is missing
+        id: settle
+        uses: ./
+        with:
+          junit-base: tests/fixtures/all_pass.xml
+          junit-head: tests/fixtures/does_not_exist.xml
+          commit-store: "false"
+          package-spec: ${{ env.PACKAGE_SPEC }}
+      - name: Assert abstained with the store untouched
+        env:
+          RESULT: ${{ steps.settle.outputs.result }}
+          DELTA: ${{ steps.settle.outputs.delta }}
+          SUMMARY: ${{ steps.settle.outputs.summary }}
+        run: |
+          echo "summary: $SUMMARY"
+          test "$RESULT" = "abstained"
+          test -z "$DELTA"
+          test ! -e .darwin-memo/lessons.json
+          printf '%s' "$SUMMARY" | python3 -c '
+          import json, sys
+          out = json.load(sys.stdin)
+          assert out["abstained"] is True, out
+          assert "reason" in out, out
+          '

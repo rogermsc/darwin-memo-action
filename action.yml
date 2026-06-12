@@ -1,0 +1,177 @@
+name: darwin-memo settle
+description: >
+  Settle a darwin-memo CI lesson store from test results. Wraps the
+  `darwin-memo settle-ci` subcommand: per-test junit XML diffing,
+  abstention on infra failures (exit code 3 becomes result=abstained,
+  never a step failure), flaky-test quarantine via a sidecar state
+  file, a degraded raw pass-count fallback, and an optional commit of
+  the updated store back to the branch.
+author: Roger Simoes
+
+branding:
+  icon: database
+  color: green
+
+inputs:
+  store-path:
+    description: >
+      Path to the ledger file. Created on first use; on abstention it
+      is left untouched (and never created).
+    default: .darwin-memo/lessons.json
+  junit-base:
+    description: >
+      junit XML report from the test run at the base commit. Primary
+      mode: set junit-base and junit-head, leave passes-before and
+      passes-after empty.
+    default: ""
+  junit-head:
+    description: junit XML report from the test run at the head or merge commit.
+    default: ""
+  passes-before:
+    description: >
+      Degraded fallback for ecosystems without junit XML: raw passing
+      count at the base commit. Both passes-before and passes-after are
+      required in this mode; never default a missing count to zero. No
+      per-test attribution, no quarantine, no infra detection.
+    default: ""
+  passes-after:
+    description: "Degraded fallback: raw passing count at the head commit."
+    default: ""
+  scale:
+    description: resource_scale for settle deltas.
+    default: "1.0"
+  expire-after:
+    description: Ticks before unsettled tickets expire at delta zero.
+    default: "50"
+  ticket:
+    description: >
+      A darwin-memo-ticket id (12 hex chars) to settle, typically
+      parsed from the merge commit message or PR body by the caller.
+      When empty, settle-ci reads `darwin-memo-ticket: <id>` lines from
+      the PR_BODY environment variable, so you can instead set
+      `env: PR_BODY: ${{ github.event.pull_request.body }}` on the
+      step that uses this action.
+    default: ""
+  detail:
+    description: Settlement detail recorded with each settled ticket.
+    default: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+  commit-store:
+    description: >
+      When "true", commit and push the updated store (and the
+      flaky.json quarantine sidecar next to it, when present) with a
+      "memory: settle and tick" message. Requires `permissions:
+      contents: write` and a checkout of the branch to push to.
+      Skipped automatically on abstention.
+    default: "true"
+  python-version:
+    description: Python version passed to actions/setup-python.
+    default: "3.12"
+  package-spec:
+    description: >
+      pip requirement used to install the CLI. settle-ci shipped in
+      darwin-memo 0.5.0, so the default enforces that floor. For
+      installs pinned to a commit instead of a PyPI release, pass
+      git+https://github.com/rogermsc/darwin-memo@<sha>.
+    default: darwin-memo>=0.5.0
+
+outputs:
+  result:
+    description: >
+      "settled" when settle-ci ran and saved the store, "abstained"
+      when the run measured nothing (exit code 3) and the store was
+      left untouched. Any other failure fails the step.
+    value: ${{ steps.settle.outputs.result }}
+  delta:
+    description: >
+      The measured change in passing tests (a float, e.g. "-1.0").
+      Only set when result is "settled".
+    value: ${{ steps.settle.outputs.delta }}
+  summary:
+    description: >
+      The one-line JSON object settle-ci printed: mode, delta,
+      per-test transitions, quarantined tests, and what settled. On
+      abstention it carries the reason instead.
+    value: ${{ steps.settle.outputs.summary }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v6
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install darwin-memo
+      shell: bash
+      env:
+        PACKAGE_SPEC: ${{ inputs.package-spec }}
+      run: pip install "$PACKAGE_SPEC"
+
+    - name: Settle tickets and tick
+      id: settle
+      shell: bash
+      env:
+        STORE_PATH: ${{ inputs.store-path }}
+        JUNIT_BASE: ${{ inputs.junit-base }}
+        JUNIT_HEAD: ${{ inputs.junit-head }}
+        PASSES_BEFORE: ${{ inputs.passes-before }}
+        PASSES_AFTER: ${{ inputs.passes-after }}
+        SCALE: ${{ inputs.scale }}
+        EXPIRE_AFTER: ${{ inputs.expire-after }}
+        TICKET: ${{ inputs.ticket }}
+        DETAIL: ${{ inputs.detail }}
+      run: |
+        args=( "$STORE_PATH" --scale "$SCALE" --expire-after "$EXPIRE_AFTER" --detail "$DETAIL" )
+        if [ -n "$JUNIT_BASE" ]; then
+          args+=( --base-xml "$JUNIT_BASE" )
+        fi
+        if [ -n "$JUNIT_HEAD" ]; then
+          args+=( --head-xml "$JUNIT_HEAD" )
+        fi
+        if [ -n "$PASSES_BEFORE" ]; then
+          args+=( --passes-before "$PASSES_BEFORE" )
+        fi
+        if [ -n "$PASSES_AFTER" ]; then
+          args+=( --passes-after "$PASSES_AFTER" )
+        fi
+        if [ -n "$TICKET" ]; then
+          args+=( --pr-body "darwin-memo-ticket: $TICKET" )
+        fi
+        set +e
+        out=$(darwin-memo settle-ci "${args[@]}")
+        code=$?
+        set -e
+        echo "$out"
+        echo "summary=$out" >> "$GITHUB_OUTPUT"
+        if [ "$code" -eq 0 ]; then
+          echo "result=settled" >> "$GITHUB_OUTPUT"
+          delta=$(printf '%s' "$out" | python -c 'import json, sys; print(json.load(sys.stdin)["delta"])')
+          echo "delta=$delta" >> "$GITHUB_OUTPUT"
+        elif [ "$code" -eq 3 ]; then
+          # The run measured nothing (no parseable junit XML, zero
+          # collected tests, or a collection error). Settling it at
+          # zero would be a lie: the store stays untouched and the
+          # step succeeds so the workflow can surface the broken
+          # measurement instead of burying it under a red X.
+          echo "result=abstained" >> "$GITHUB_OUTPUT"
+          echo "::notice::darwin-memo settle-ci abstained; store left untouched."
+        else
+          exit "$code"
+        fi
+
+    - name: Commit the store
+      if: ${{ inputs.commit-store == 'true' && steps.settle.outputs.result == 'settled' }}
+      shell: bash
+      env:
+        STORE_PATH: ${{ inputs.store-path }}
+      run: |
+        git config user.name "darwin-memo-settler"
+        git config user.email "actions@users.noreply.github.com"
+        git add -- "$STORE_PATH"
+        sidecar="$(dirname "$STORE_PATH")/flaky.json"
+        if [ -f "$sidecar" ]; then
+          git add -- "$sidecar"
+        fi
+        if ! git diff --cached --quiet; then
+          git commit -m "memory: settle and tick"
+          git push
+        fi
